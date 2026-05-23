@@ -141,6 +141,13 @@ if (WASI STREQUAL "p1")
     cloudlibc/src/libc/sys/socket/send.c
     cloudlibc/src/libc/sys/socket/shutdown.c
     sources/accept-wasip1.c
+    # `cwd_hint.c` declares a wasi_snapshot_preview1 import for the
+    # experimental `cwd_get_suggested` hostcall (WASI#771); the eager
+    # startup constructor seeds `__wasilibc_cwd` from the host-provided
+    # hint. Strong reference from `getcwd.c` pulls it into every guest
+    # that calls `getcwd(3)`. p1-only — see comment in getcwd.c for why
+    # the preview1 import is meaningless under p2/p3.
+    sources/cwd_hint.c
   )
 else()
   list(APPEND bottom_half_sources

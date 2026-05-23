@@ -1,0 +1,112 @@
+name: cwd-hint
+
+# CI for the cwd-hint experimental branch — the wasi-libc half of the
+# reference implementation of the `cwd_get_suggested` Preview 1 hostcall
+# proposed at https://github.com/WebAssembly/WASI/issues/771.
+#
+# Scoped to the `cwd-hint-v32` branch + manual dispatch so it does not
+# fire on every push to the fork. The upstream CI matrix is large (>20
+# rows across operating systems, clang versions, and target triples);
+# this branch trims to a single ubuntu + wasm32-wasip1 smoke build to
+# make iteration fast. Restore the full matrix on any branch destined
+# for an upstream PR.
+
+on:
+  push:
+    branches: [cwd-hint-v32]
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: Smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: true
+
+    # Reuse upstream's clang-install composite. Clang 20 matches what
+    # upstream's `Test wasm32-wasip1` row uses.
+    - uses: ./.github/actions/setup
+      with:
+        clang_version: '20'
+
+    - name: Configure libc (cmake)
+      run: |
+        cmake -G Ninja -S . -B build \
+          -DCHECK_SYMBOLS=ON \
+          -DTARGET_TRIPLE=wasm32-wasip1 \
+          -DCMAKE_LINK_DEPENDS_USE_LINKER=OFF
+
+    - name: Build
+      run: ninja -C build -v
+
+    # The CHECK_SYMBOLS=ON above runs the same defined-/undefined-symbols
+    # diff against `expected/wasm32-wasip1/` that upstream's CI does. If
+    # the build above succeeded, the symbol surface for the new hostcall
+    # is exactly what we predicted. Confirm the new symbols are present
+    # in the artifacts the way we expect.
+    - name: Verify cwd-hint symbols are present
+      run: |
+        # Note: wasi-libc's CMake build no longer generates `libc.imports`
+        # (the old Makefile derived it from a grep over undefined-symbols.txt;
+        # CMake dropped that step). The two assertions below cover the
+        # same surface — `__wasilibc_apply_cwd_hint` proves cwd_hint.o was
+        # built and exported its constructor, `cwd_get_suggested` proves
+        # the wasm import made it into the static archive's undefined-symbol
+        # set, which is what consumers actually link against.
+        set -e
+        SHARE="$(pwd)/build/sysroot/share/wasm32-wasip1"
+        grep -q '^__wasilibc_apply_cwd_hint$' "$SHARE/defined-symbols.txt"
+        grep -q '^__imported_wasi_snapshot_preview1_cwd_get_suggested$' "$SHARE/undefined-symbols.txt"
+
+    - name: Smoke-link a getcwd consumer against the patched sysroot
+      run: |
+        # Install wasi-sdk-33 so we have a known-good clang+lld that
+        # understands the patched sysroot layout. The wasi-libc build
+        # above used host clang-20, but the demo consumers downstream
+        # use wasi-sdk-bundled clang; this smoke test mirrors that.
+        cd /tmp
+        curl -fsSL https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-33/wasi-sdk-33.0-x86_64-linux.tar.gz | tar xzf -
+        export WASI_SDK_PATH=/tmp/wasi-sdk-33.0-x86_64-linux
+        cat > /tmp/getcwd-printf.c <<'EOF'
+        #include <stdio.h>
+        #include <unistd.h>
+        int main(void) {
+            char buf[4096];
+            if (getcwd(buf, sizeof buf) == NULL) {
+                perror("getcwd");
+                return 1;
+            }
+            puts(buf);
+            return 0;
+        }
+        EOF
+        "$WASI_SDK_PATH/bin/clang" --target=wasm32-wasip1 \
+            --sysroot="$GITHUB_WORKSPACE/build/sysroot" \
+            -O2 /tmp/getcwd-printf.c -o /tmp/getcwd-printf.wasm
+        ls -la /tmp/getcwd-printf.wasm
+
+    - name: Verify the linked module imports cwd_get_suggested
+      run: |
+        # The smoke binary must declare the new hostcall as an import — that
+        # proves cwd_hint.o was pulled in via the strong reference from
+        # getcwd.o.
+        strings /tmp/getcwd-printf.wasm | grep -q '^cwd_get_suggested$'
+
+    - uses: actions/upload-artifact@v6
+      if: always()
+      with:
+        name: patched-sysroot-wasm32-wasip1
+        path: |
+          build/sysroot
+          /tmp/getcwd-printf.wasm
