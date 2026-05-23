@@ -1,0 +1,110 @@
+name: cwd-hint
+
+# CI for the cwd-hint experimental branch — the wasi-libc half of the
+# reference implementation of the `cwd_get_suggested` Preview 1 hostcall
+# proposed at https://github.com/WebAssembly/WASI/issues/771.
+#
+# Scoped to the `cwd-hint` branch + manual dispatch so it does not fire on
+# every push to the fork. The upstream CI matrix is large (six rows
+# across three operating systems and three target triples) and slow on
+# every commit; this branch trims to a single ubuntu + wasm32-wasip1
+# smoke build to make iteration fast. Restore the full matrix on any
+# branch destined for an upstream PR.
+
+on:
+  push:
+    branches: [cwd-hint]
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  WASI_SDK_VERSION: '25'
+  WASI_SDK_ASSET: 'wasi-sdk-25.0-x86_64-linux.tar.gz'
+  WASI_SDK_DIR: 'wasi-sdk-25.0-x86_64-linux'
+
+jobs:
+  smoke:
+    name: Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: true
+
+    # The upstream main.yml downloads bare LLVM and points wasi-libc's CC/AR/NM
+    # at it. For this branch we use wasi-sdk-25's bundled clang+lld directly:
+    # the bake step needs the wasm-aware lld anyway, and the wasi-sdk tarball
+    # ships a known-good combination of clang, lld, llvm-ar, and llvm-nm.
+    - name: Install wasi-sdk-25
+      run: |
+        cd /tmp
+        curl -fsSL "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/${WASI_SDK_ASSET}" \
+          | tar xzf -
+        echo "WASI_SDK_PATH=/tmp/${WASI_SDK_DIR}" >> "$GITHUB_ENV"
+
+    - name: Build patched wasm32-wasip1 sysroot
+      run: |
+        rm -rf build/sysroot-patched build/wasm32-wasip1 build/llvm-lto
+        CC="$WASI_SDK_PATH/bin/clang" \
+        AR="$WASI_SDK_PATH/bin/llvm-ar" \
+        NM="$WASI_SDK_PATH/bin/llvm-nm" \
+        make -j4 TARGET_TRIPLE=wasm32-wasip1 \
+             SYSROOT="$(pwd)/build/sysroot-patched"
+
+    # The Makefile's check-symbols target already diffs the generated
+    # symbol lists against `expected/wasm32-wasip1/`; if the build above
+    # succeeded, the symbol surface for the new hostcall is exactly what
+    # we predicted. Confirm the new symbols are present in the artifacts
+    # the way we expect — this is paranoia, not gating, but a green CI
+    # bug here would otherwise be silent.
+    - name: Verify cwd-hint symbols are present
+      run: |
+        set -e
+        SHARE="$(pwd)/build/sysroot-patched/share/wasm32-wasip1"
+        LIB="$(pwd)/build/sysroot-patched/lib/wasm32-wasip1"
+        grep -q '^__wasilibc_apply_cwd_hint$' "$SHARE/defined-symbols.txt"
+        grep -q '^__imported_wasi_snapshot_preview1_cwd_get_suggested$' "$SHARE/undefined-symbols.txt"
+        grep -q '^__imported_wasi_snapshot_preview1_cwd_get_suggested$' "$LIB/libc.imports"
+
+    - name: Smoke-link a getcwd consumer against the patched sysroot
+      run: |
+        cat > /tmp/getcwd-printf.c <<'EOF'
+        #include <stdio.h>
+        #include <unistd.h>
+        int main(void) {
+            char buf[4096];
+            if (getcwd(buf, sizeof buf) == NULL) {
+                perror("getcwd");
+                return 1;
+            }
+            puts(buf);
+            return 0;
+        }
+        EOF
+        "$WASI_SDK_PATH/bin/clang" --target=wasm32-wasip1 \
+            --sysroot="$(pwd)/build/sysroot-patched" \
+            -O2 /tmp/getcwd-printf.c -o /tmp/getcwd-printf.wasm
+        ls -la /tmp/getcwd-printf.wasm
+
+    - name: Verify the linked module imports cwd_get_suggested
+      run: |
+        # The smoke binary must declare the new hostcall as an import — that
+        # proves cwd_hint.o was pulled in via the strong reference from
+        # getcwd.o. `strings` is good enough; the module is tiny.
+        strings /tmp/getcwd-printf.wasm | grep -q '^cwd_get_suggested$'
+
+    - uses: actions/upload-artifact@v6
+      if: always()
+      with:
+        name: patched-sysroot-wasm32-wasip1
+        path: |
+          build/sysroot-patched
+          /tmp/getcwd-printf.wasm

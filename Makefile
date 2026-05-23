@@ -118,7 +118,8 @@ LIBC_BOTTOM_HALF_OMIT_SOURCES := \
 	$(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC)/libc/sys/socket/recv.c \
 	$(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC)/libc/sys/socket/shutdown.c \
 	$(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC)/libc/sys/socket/getsockopt.c \
-	$(LIBC_BOTTOM_HALF_SOURCES)/accept-wasip1.c
+	$(LIBC_BOTTOM_HALF_SOURCES)/accept-wasip1.c \
+	$(LIBC_BOTTOM_HALF_SOURCES)/cwd_hint.c
 LIBC_BOTTOM_HALF_ALL_SOURCES := $(filter-out $(LIBC_BOTTOM_HALF_OMIT_SOURCES),$(LIBC_BOTTOM_HALF_ALL_SOURCES))
 endif
 
